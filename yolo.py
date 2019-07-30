@@ -16,7 +16,6 @@ from PIL import Image, ImageFont, ImageDraw
 from yolo3.model import yolo_eval, yolo_body, tiny_yolo_body
 from yolo3.utils import letterbox_image
 from keras.utils import multi_gpu_model
-import cv2 as cv
 import nms
 
 
@@ -112,18 +111,6 @@ class YOLO(object):
             arr.append((top, left, bottom, right))
         return np.array(arr)
 
-    def nms_old(self, out_boxes, out_scores, confidence, nms_threshold):
-        # cv.dnn.NMSBoxes cannot take np.array as argument
-        out_boxes_conv = []
-        out_scores_conv = []
-        for i, box in enumerate(out_boxes):
-            top, left, bottom, right = box
-            out_boxes_conv.append([int(top), int(left), int(bottom), int(right)])
-            out_scores_conv.append(float(out_scores[i]))
-
-        idxs = cv.dnn.NMSBoxes(out_boxes_conv, out_scores_conv, confidence, nms_threshold)
-        return idxs
-
     def nms(self, boxes, scores, classes, confidence, nms_threshold):
         num_classes = len(self.class_names)
         scores_conv = np.zeros((scores.shape[0], num_classes))
@@ -172,11 +159,6 @@ class YOLO(object):
 
         print('Found {} raw boxes for {}'.format(len(out_boxes), 'img'))
 
-        # out_boxes_conv = self.conv_out_boxes(out_boxes, image)
-        # idxs = self.nms(out_boxes_conv, out_scores, confidence, nms_threshold)
-        # if len(idxs) == 0:
-        #     return image
-
         out_boxes = self.conv_out_boxes(out_boxes, image)
         out_boxes, out_scores, out_classes = self.nms(
                 out_boxes, out_scores, out_classes,
@@ -188,8 +170,6 @@ class YOLO(object):
                     size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
         thickness = (image.size[0] + image.size[1]) // 300
 
-        # for i, c in reversed(list(enumerate(out_classes))):
-        # for idx_ in enumerate(idxs):
         for i, box in enumerate(out_boxes):
             score = out_scores[i]
             c = out_classes[i]
@@ -200,10 +180,6 @@ class YOLO(object):
             label_size = draw.textsize(label, font)
 
             top, left, bottom, right = box
-            # top = max(0, np.floor(top + 0.5).astype('int32'))
-            # left = max(0, np.floor(left + 0.5).astype('int32'))
-            # bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
-            # right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
             print(label, (left, top), (right, bottom))
 
             if top - label_size[1] >= 0:
