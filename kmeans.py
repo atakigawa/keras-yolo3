@@ -1,15 +1,17 @@
 import numpy as np
+import argparse
 
 
 class YOLO_Kmeans:
 
-    def __init__(self, cluster_number, filename):
-        self.cluster_number = cluster_number
-        self.filename = "2012_train.txt"
+    def __init__(self, num_clusters, in_file, out_file):
+        self.num_clusters = num_clusters
+        self.in_file = in_file
+        self.out_file = out_file
 
     def iou(self, boxes, clusters):  # 1 box -> k clusters
         n = boxes.shape[0]
-        k = self.cluster_number
+        k = self.num_clusters
 
         box_area = boxes[:, 0] * boxes[:, 1]
         box_area = box_area.repeat(k)
@@ -58,7 +60,7 @@ class YOLO_Kmeans:
         return clusters
 
     def result2txt(self, data):
-        f = open("yolo_anchors.txt", 'w')
+        f = open(self.out_file, 'w')
         row = np.shape(data)[0]
         for i in range(row):
             if i == 0:
@@ -69,7 +71,7 @@ class YOLO_Kmeans:
         f.close()
 
     def txt2boxes(self):
-        f = open(self.filename, 'r')
+        f = open(self.in_file, 'r')
         dataSet = []
         for line in f:
             infos = line.split(" ")
@@ -86,7 +88,7 @@ class YOLO_Kmeans:
 
     def txt2clusters(self):
         all_boxes = self.txt2boxes()
-        result = self.kmeans(all_boxes, k=self.cluster_number)
+        result = self.kmeans(all_boxes, k=self.num_clusters)
         result = result[np.lexsort(result.T[0, None])]
         self.result2txt(result)
         print("K anchors:\n {}".format(result))
@@ -95,7 +97,21 @@ class YOLO_Kmeans:
 
 
 if __name__ == "__main__":
-    cluster_number = 9
-    filename = "2012_train.txt"
-    kmeans = YOLO_Kmeans(cluster_number, filename)
+    parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS)
+    parser.add_argument(
+        '--num_clusters', type=int, required=False, default=9,
+        help='number of kmeans clusters')
+    parser.add_argument(
+        '--annotations_path', type=str, required=True,
+        help='path to annotation file')
+    parser.add_argument(
+        '--out_file', type=str, required=True,
+        help='filename to output the result to')
+
+    opts = parser.parse_args()
+
+    kmeans = YOLO_Kmeans(
+            opts.num_clusters,
+            opts.annotations_path,
+            opts.out_file)
     kmeans.txt2clusters()

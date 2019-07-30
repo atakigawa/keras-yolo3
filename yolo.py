@@ -15,18 +15,20 @@ from PIL import Image, ImageFont, ImageDraw
 
 from yolo3.model import yolo_eval, yolo_body, tiny_yolo_body
 from yolo3.utils import letterbox_image
-import os
 from keras.utils import multi_gpu_model
+import cv2 as cv
+import nms
+
 
 class YOLO(object):
     _defaults = {
-        "model_path": 'model_data/yolo.h5',
+        "model_path": 'model_data/yolo_weights.h5',
         "anchors_path": 'model_data/yolo_anchors.txt',
         "classes_path": 'model_data/coco_classes.txt',
-        "score" : 0.3,
-        "iou" : 0.45,
-        "model_image_size" : (416, 416),
-        "gpu_num" : 1,
+        "score": 0.3,
+        "iou": 0.45,
+        "model_image_size": (416, 416),
+        "gpu_num": 1,
     }
 
     @classmethod
@@ -37,8 +39,8 @@ class YOLO(object):
             return "Unrecognized attribute name '" + n + "'"
 
     def __init__(self, **kwargs):
-        self.__dict__.update(self._defaults) # set up default values
-        self.__dict__.update(kwargs) # and update with user overrides
+        self.__dict__.update(self._defaults)  # set up default values
+        self.__dict__.update(kwargs)  # and update with user overrides
         self.class_names = self._get_class()
         self.anchors = self._get_anchors()
         self.sess = K.get_session()
@@ -65,13 +67,13 @@ class YOLO(object):
         # Load model, or construct model and load weights.
         num_anchors = len(self.anchors)
         num_classes = len(self.class_names)
-        is_tiny_version = num_anchors==6 # default setting
+        is_tiny_version = num_anchors == 6  # default setting
         try:
             self.yolo_model = load_model(model_path, compile=False)
-        except:
+        except Exception:
             self.yolo_model = tiny_yolo_body(Input(shape=(None,None,3)), num_anchors//2, num_classes) \
                 if is_tiny_version else yolo_body(Input(shape=(None,None,3)), num_anchors//3, num_classes)
-            self.yolo_model.load_weights(self.model_path) # make sure model, anchors and classes match
+            self.yolo_model.load_weights(self.model_path)  # make sure model, anchors and classes match
         else:
             assert self.yolo_model.layers[-1].output_shape[-1] == \
                 num_anchors/len(self.yolo_model.output) * (num_classes + 5), \
@@ -92,19 +94,62 @@ class YOLO(object):
 
         # Generate output tensor targets for filtered bounding boxes.
         self.input_image_shape = K.placeholder(shape=(2, ))
-        if self.gpu_num>=2:
+        if self.gpu_num >= 2:
             self.yolo_model = multi_gpu_model(self.yolo_model, gpus=self.gpu_num)
         boxes, scores, classes = yolo_eval(self.yolo_model.output, self.anchors,
                 len(self.class_names), self.input_image_shape,
                 score_threshold=self.score, iou_threshold=self.iou)
         return boxes, scores, classes
 
+    def conv_out_boxes(self, out_boxes, image):
+        arr = []
+        for i, box in enumerate(out_boxes):
+            top, left, bottom, right = box
+            top = max(0, np.floor(top + 0.5).astype('int32'))
+            left = max(0, np.floor(left + 0.5).astype('int32'))
+            bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
+            right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
+            arr.append((top, left, bottom, right))
+        return np.array(arr)
+
+    def nms_old(self, out_boxes, out_scores, confidence, nms_threshold):
+        # cv.dnn.NMSBoxes cannot take np.array as argument
+        out_boxes_conv = []
+        out_scores_conv = []
+        for i, box in enumerate(out_boxes):
+            top, left, bottom, right = box
+            out_boxes_conv.append([int(top), int(left), int(bottom), int(right)])
+            out_scores_conv.append(float(out_scores[i]))
+
+        idxs = cv.dnn.NMSBoxes(out_boxes_conv, out_scores_conv, confidence, nms_threshold)
+        return idxs
+
+    def nms(self, boxes, scores, classes, confidence, nms_threshold):
+        num_classes = len(self.class_names)
+        scores_conv = np.zeros((scores.shape[0], num_classes))
+        for i, c_idx in enumerate(classes):
+            scores_conv[i][c_idx] = scores[i]
+
+        use_gpu_nms = False
+        if use_gpu_nms:
+            boxes, scores, classes = nms.gpu_nms(boxes, scores_conv,
+                    num_classes, max_boxes=50,
+                    score_thresh=confidence, iou_thresh=nms_threshold)
+            boxes, scores, classes = self.sess.run([boxes, scores, classes])
+        else:
+            boxes, scores, classes = nms.cpu_nms(boxes, scores_conv,
+                    num_classes, max_boxes=50,
+                    score_thresh=confidence, iou_thresh=nms_threshold)
+        return boxes, scores, classes
+
     def detect_image(self, image):
+        confidence = self.confidence
+        nms_threshold = self.nms_threshold
         start = timer()
 
         if self.model_image_size != (None, None):
-            assert self.model_image_size[0]%32 == 0, 'Multiples of 32 required'
-            assert self.model_image_size[1]%32 == 0, 'Multiples of 32 required'
+            assert self.model_image_size[0] % 32 == 0, 'Multiples of 32 required'
+            assert self.model_image_size[1] % 32 == 0, 'Multiples of 32 required'
             boxed_image = letterbox_image(image, tuple(reversed(self.model_image_size)))
         else:
             new_image_size = (image.width - (image.width % 32),
@@ -112,7 +157,8 @@ class YOLO(object):
             boxed_image = letterbox_image(image, new_image_size)
         image_data = np.array(boxed_image, dtype='float32')
 
-        print(image_data.shape)
+        print('detect_image, shape={}, confidence={}, nms_thres={}'.format(
+            image_data.shape, confidence, nms_threshold))
         image_data /= 255.
         image_data = np.expand_dims(image_data, 0)  # Add batch dimension.
 
@@ -124,26 +170,40 @@ class YOLO(object):
                 K.learning_phase(): 0
             })
 
-        print('Found {} boxes for {}'.format(len(out_boxes), 'img'))
+        print('Found {} raw boxes for {}'.format(len(out_boxes), 'img'))
+
+        # out_boxes_conv = self.conv_out_boxes(out_boxes, image)
+        # idxs = self.nms(out_boxes_conv, out_scores, confidence, nms_threshold)
+        # if len(idxs) == 0:
+        #     return image
+
+        out_boxes = self.conv_out_boxes(out_boxes, image)
+        out_boxes, out_scores, out_classes = self.nms(
+                out_boxes, out_scores, out_classes,
+                confidence, nms_threshold)
+
+        print('{} boxes after nms'.format(len(out_boxes)))
 
         font = ImageFont.truetype(font='font/FiraMono-Medium.otf',
                     size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
         thickness = (image.size[0] + image.size[1]) // 300
 
-        for i, c in reversed(list(enumerate(out_classes))):
-            predicted_class = self.class_names[c]
-            box = out_boxes[i]
+        # for i, c in reversed(list(enumerate(out_classes))):
+        # for idx_ in enumerate(idxs):
+        for i, box in enumerate(out_boxes):
             score = out_scores[i]
+            c = out_classes[i]
+            predicted_class = self.class_names[c]
 
             label = '{} {:.2f}'.format(predicted_class, score)
             draw = ImageDraw.Draw(image)
             label_size = draw.textsize(label, font)
 
             top, left, bottom, right = box
-            top = max(0, np.floor(top + 0.5).astype('int32'))
-            left = max(0, np.floor(left + 0.5).astype('int32'))
-            bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
-            right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
+            # top = max(0, np.floor(top + 0.5).astype('int32'))
+            # left = max(0, np.floor(left + 0.5).astype('int32'))
+            # bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
+            # right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
             print(label, (left, top), (right, bottom))
 
             if top - label_size[1] >= 0:
@@ -163,20 +223,21 @@ class YOLO(object):
             del draw
 
         end = timer()
-        print(end - start)
+        print('seconds elapsed: {}'.format(end - start))
         return image
 
     def close_session(self):
         self.sess.close()
+
 
 def detect_video(yolo, video_path, output_path=""):
     import cv2
     vid = cv2.VideoCapture(video_path)
     if not vid.isOpened():
         raise IOError("Couldn't open webcam or video")
-    video_FourCC    = int(vid.get(cv2.CAP_PROP_FOURCC))
-    video_fps       = vid.get(cv2.CAP_PROP_FPS)
-    video_size      = (int(vid.get(cv2.CAP_PROP_FRAME_WIDTH)),
+    video_FourCC = int(vid.get(cv2.CAP_PROP_FOURCC))
+    video_fps = vid.get(cv2.CAP_PROP_FPS)
+    video_size = (int(vid.get(cv2.CAP_PROP_FRAME_WIDTH)),
                         int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     isOutput = True if output_path != "" else False
     if isOutput:
@@ -209,4 +270,3 @@ def detect_video(yolo, video_path, output_path=""):
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     yolo.close_session()
-
